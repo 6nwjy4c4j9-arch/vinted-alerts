@@ -25,7 +25,7 @@ STATE_FILE = Path("vinted_seen_items.json")
 
 # Tailles acceptées -> vérification LOCALE avant chaque alerte (infaillible).
 # Matching tolérant : "L" accepte "L" et "L / UK 16-18", mais ni "XL" ni "Large".
-# Plusieurs tailles : {"M", "L"} — vide set() = tout accepter.
+# Plusieurs tailles : {"L", "W32", "36 in | 90 cm"} — vide set() = tout accepter.
 ALLOWED_SIZES = {"L"}
 
 # Paramètre du filtre taille côté API :
@@ -33,7 +33,9 @@ ALLOWED_SIZES = {"L"}
 #   "attribute_ids[size]" ou "size_ids" -> force une variante
 SIZE_PARAM = "auto"
 
-# Colle ici tes URLs de recherche Vinted (page catalog), telles quelles
+# Colle ici tes URLs de recherche Vinted (page catalog), telles quelles.
+# Pas besoin de trier les size_ids : le script apprend lequel correspond
+# à quelle taille et n'utilise que ceux qui matchent ALLOWED_SIZES.
 SEARCH_URLS = [
     "https://www.vinted.co.uk/catalog?search_text=Colt&brand_ids[]=368277&size_ids[]=209&size_ids[]=1438&size_ids[]=1638&size_ids[]=1640&search_id=4252287858&order=newest_first",
 ]
@@ -54,10 +56,10 @@ PARAM_MAP = {
 
 # Variantes pour le filtre taille, par ordre de préférence.
 # Format confirmé de la nouvelle API : CSV dans une seule valeur
-# (attribute_ids[size]=209,1438) — les formes répétées clé[]=v sont ignorées.
+# (attribute_ids[size]=209,1438) ; les formes répétées clé[]=v sont ignorées.
 SIZE_VARIANTS = [
     ("attribute_ids[size] (csv)", "attribute_ids[size]"),
-    ("size_ids[] (répété)", "size_ids"),      # ancienne syntaxe du site, fallback
+    ("size_ids[] (répété)", "size_ids"),
 ]
 SIZE_KEYS = {key for _, key in SIZE_VARIANTS}
 
@@ -104,14 +106,8 @@ def url_to_params(url):
 
 
 def encode_query(params, repeat_size=False):
-    """Query string.
-
-    Format confirmé de la nouvelle API (sept. 2026) : les filtres
-    multi-valeurs sont passés en CSV dans une seule valeur
-    (attribute_ids[size]=209,1438,1638,1640) ; les formes répétées
-    clé[]=v sont silencieusement ignorées par l'API.
-    repeat_size=True -> encode size_ids en clé[] répétée (variante fallback).
-    """
+    """Query string ; filtres multi-valeurs en CSV dans une seule valeur
+    (format de la nouvelle API). repeat_size=True -> size_ids en clé[] répétée."""
     pairs = []
     for key, val in params.items():
         if isinstance(val, list):
@@ -165,12 +161,8 @@ def get_item_box(item):
 
 
 def extract_size(item):
-    """Taille de l'article.
-
-    Depuis sept. 2026 l'API catalogue renvoie size_title=null : la taille
-    se trouve dans item_box.accessibility_label ("..., Size: L / UK 16-18, ...")
-    ou item_box.second_line ("L / UK 16-18 · Very good").
-    """
+    """Taille : size_title (si présent), sinon item_box.accessibility_label
+    ("..., Size: L / UK 16-18, ...") ou item_box.second_line ("L / UK 16-18 · Very good")."""
     size = item.get("size_title")
     if size:
         return str(size).strip()
@@ -184,7 +176,7 @@ def extract_size(item):
     second = str(box.get("second_line") or "")
     if "·" in second:                       # "L / UK 16-18 · Very good"
         return second.split("·", 1)[0].strip()
-    return ""                               # pas de "·" = condition seule
+    return ""
 
 
 def extract_brand(item):
@@ -216,32 +208,40 @@ def size_matches(size_title, allowed):
     return False
 
 
-def choose_syntax(session, params, name):
-    """Trouve la variante qui filtre RÉELLEMENT par taille.
+def normalize_ids(v):
+    """size_ids peut être une string (1 ID) ou une liste -> liste de strings."""
+    if v is None:
+        return []
+    return [str(x) for x in v] if isinstance(v, list) else [str(v)]
 
-    Vinted répond HTTP 200 même quand il ignore un filtre inconnu : on
-    compare donc les tailles renvoyées avec filtre à une requête de
-    référence SANS filtre taille. Les sponsorisés sont exclus de
-    l'analyse (ils ignorent les filtres par conception).
+
+def choose_syntax(session, params, name, raw_ids):
+    """Trouve la variante d'encodage qui filtre RÉELLEMENT par taille.
+
+    Vinted répond HTTP 200 même en ignorant un filtre : on compare donc les
+    tailles renvoyées avec filtre à une référence SANS filtre taille. Un
+    filtre effectif réduit le nombre de tailles distinctes (les sponsorisés
+    sont exclus de l'analyse : ils ignorent les filtres par conception).
     """
-    print(f"[?] Détection du filtre taille pour '{name}' :")
+    print(f"[?] Détection du format du filtre taille pour '{name}' :")
     allowed = list(ALLOWED_SIZES)
 
-    base_sizes = set()
-    base = {k: v for k, v in params.items() if k != "size_ids"}
+    base_sizes, base_count = set(), 0
     try:
-        base_items, _ = fetch_query(session, encode_query(base))
-        base_sizes = {(extract_size(i) or "?").strip().lower() for i in organic(base_items)}
-        print(f"    {'sans filtre':26} : {len(organic(base_items)):3} articles | "
+        base_items, _ = fetch_query(session, encode_query(params))
+        org = organic(base_items)
+        base_count = len(org)
+        base_sizes = {(extract_size(i) or "?").strip().lower() for i in org}
+        print(f"    {'sans filtre':26} : {base_count:3} articles | "
               f"{len(base_sizes)} tailles distinctes")
     except Exception as e:
         print(f"    {'sans filtre':26} : échec ({e})")
     time.sleep(1)
 
-    results = []  # (clé, nb_articles, filtre_effectif, tailles, hors_sélection)
+    results = []  # (clé, nb_articles, filtre_effectif)
     for label, key in SIZE_VARIANTS:
         p = dict(params)
-        p[key] = p.pop("size_ids")
+        p[key] = raw_ids
         try:
             items, _ = fetch_query(session, encode_query(p, repeat_size=(key == "size_ids")))
         except Exception as e:
@@ -250,31 +250,71 @@ def choose_syntax(session, params, name):
             continue
         org = organic(items)
         sizes = {(extract_size(i) or "?").strip().lower() for i in org}
-        if allowed:
-            hors = sorted(s for s in sizes if not size_matches(s, allowed))
-            effectif = bool(sizes) and not hors
+        if base_sizes:
+            effectif = bool(sizes) and sizes < base_sizes
+            detail = f"({len(base_sizes)} -> {len(sizes)} tailles)" if effectif else ""
+        elif allowed:
+            effectif = bool(sizes) and all(size_matches(s, allowed) for s in sizes)
+            detail = ""
         else:
-            hors = []
-            effectif = bool(base_sizes) and sizes < base_sizes
-        verdict = "✔ filtre effectif" if effectif else "✘ filtre ignoré"
+            effectif, detail = False, ""
+        verdict = f"✔ filtre effectif {detail}" if effectif else "✘ filtre ignoré"
         print(f"    {label:26} : {len(org):3} articles | "
               f"tailles : {', '.join(sorted(sizes)) or 'aucune'} | {verdict}")
-        results.append((key, len(org), effectif, sizes, hors))
+        results.append((key, len(org), effectif))
         time.sleep(1)
 
     if not results:
         raise RuntimeError("aucune variante du filtre taille n'a fonctionné (API bloquée ?)")
-
     bonnes = [r for r in results if r[2]]
     if bonnes:
         best = max(bonnes, key=lambda r: r[1])
-        print(f"[✓] Filtre taille opérationnel via « {best[0]} »")
+        print(f"[✓] Format retenu : « {best[0]} »")
     else:
-        avec_items = [r for r in results if r[1] > 0] or results
-        best = min(avec_items, key=lambda r: (len(r[4]), -r[1]))
-        print("[!] Aucune variante ne filtre réellement — le filtrage local "
+        best = max(results, key=lambda r: r[1])
+        print("[!] Aucun format ne filtre réellement — le filtrage local "
               "(ALLOWED_SIZES) prend le relais")
     return best[0]
+
+
+def learn_size_ids(session, params, name, key, ids):
+    """Sonde chaque size_id individuellement pour déduire sa taille réelle.
+
+    Les IDs de l'URL ne correspondent pas toujours aux tailles voulues
+    (ex. W30/W32 mélangés à des L) : on lit la taille des résultats de
+    chaque ID pris seul, et pick_size_ids ne gardera que les utiles.
+    """
+    print(f"[?] Apprentissage des IDs de taille pour '{name}' :")
+    mapping = {}
+    for sid in ids:
+        p = dict(params)
+        p[key] = [sid]
+        count, sizes = 0, []
+        try:
+            items, _ = fetch_query(session, encode_query(p, repeat_size=(key == "size_ids")))
+            org = organic(items)
+            count = len(org)
+            sizes = sorted({(extract_size(i) or "?").strip().lower() for i in org})
+        except Exception as e:
+            print(f"    ID {sid:6} : échec — {e}")
+        mapping[sid] = sizes
+        keep = not sizes or any(size_matches(s, ALLOWED_SIZES) for s in sizes)
+        print(f"    ID {sid:6} : {count:3} articles | "
+              f"tailles : {', '.join(sizes) or 'aucune'} | "
+              f"{'✔ gardé' if keep else '✘ écarté'}")
+        time.sleep(1)
+    return mapping
+
+
+def pick_size_ids(mapping, raw_ids):
+    """Ne garde que les IDs dont la taille observée correspond à ALLOWED_SIZES
+    (ou est inconnue/vide : le garde-fou local couvrira)."""
+    good = []
+    for sid in raw_ids:
+        sizes = mapping.get(sid)
+        if sizes is None or not sizes or any(size_matches(s, ALLOWED_SIZES) for s in sizes):
+            good.append(sid)
+    return good
 
 
 def build_item_url(item):
@@ -303,15 +343,16 @@ def load_state():
     if STATE_FILE.exists():
         data = json.loads(STATE_FILE.read_text())
         if isinstance(data, list):                     # très ancien format
-            return set(data), None
-        # Ancienne clé "size_param" volontairement ignorée : ce cache date
-        # d'avant la découverte du format CSV -> nouvelle détection.
-        return set(data.get("seen", [])), data.get("size_param_v2")
-    return set(), None
+            return set(data), None, None
+        id_map = data.get("size_id_map")
+        id_map = {str(k): list(v) for k, v in id_map.items()} if isinstance(id_map, dict) else None
+        return set(data.get("seen", [])), data.get("size_param_v2"), id_map
+    return set(), None, None
 
 
-def save_state(seen, size_param=None):
-    STATE_FILE.write_text(json.dumps({"seen": sorted(seen), "size_param_v2": size_param}))
+def save_state(seen, syntax=None, id_map=None):
+    STATE_FILE.write_text(json.dumps(
+        {"seen": sorted(seen), "size_param_v2": syntax, "size_id_map": id_map or {}}))
 
 
 # ---------- Telegram ----------
@@ -359,35 +400,51 @@ def send_alert(item, search_name):
 
 # ---------- Scan ----------
 
-def run_once(seen, alert=True, syntax=None):
+def run_once(seen, alert=True, syntax=None, id_map=None):
     session = new_session()
     for url in SEARCH_URLS:
         params = url_to_params(url)
         name = params.get("search_text", "recherche")
         params["order"] = "newest_first"
         params["per_page"] = 96
-        has_size = "size_ids" in params
+        raw_ids = normalize_ids(params.pop("size_ids", None))
 
         try:
-            if has_size:
-                if SIZE_PARAM in SIZE_KEYS:               # variante imposée
+            if raw_ids:
+                # 1) Format d'encodage du filtre taille
+                if SIZE_PARAM in SIZE_KEYS:
                     key = SIZE_PARAM
-                else:                                     # auto
+                else:
                     if not syntax or syntax not in SIZE_KEYS:
-                        syntax = choose_syntax(session, params, name)
+                        syntax = choose_syntax(session, params, name, raw_ids)
                     key = syntax
+
+                # 2) Apprentissage : quel ID correspond à quelle taille ?
+                id_map = id_map or {}
+                missing = [sid for sid in raw_ids if sid not in id_map]
+                if missing:
+                    id_map.update(learn_size_ids(session, params, name, key, missing))
+                good = pick_size_ids(id_map, raw_ids)
+                use_ids = good or raw_ids
+                if good:
+                    print(f"[✓] IDs retenus (tailles autorisées) : {', '.join(good)}")
+                else:
+                    print("[!] Aucun ID ne correspond aux tailles autorisées "
+                          "-> tous les IDs + garde-fou local")
+
+                # 3) Requête principale
                 p = dict(params)
-                p[key] = p.pop("size_ids")
+                p[key] = use_ids
                 try:
                     items, _ = fetch_query(session, encode_query(p, repeat_size=(key == "size_ids")))
                 except Exception:
                     if SIZE_PARAM in SIZE_KEYS:
                         raise
-                    print("[!] Variante en cache échouée -> nouvelle détection")
-                    syntax = choose_syntax(session, params, name)
+                    print("[!] Requête échouée -> nouvelle détection du format")
+                    syntax = choose_syntax(session, params, name, raw_ids)
                     key = syntax
                     p = dict(params)
-                    p[key] = p.pop("size_ids")
+                    p[key] = use_ids
                     items, _ = fetch_query(session, encode_query(p, repeat_size=(key == "size_ids")))
             else:
                 items, _ = fetch_query(session, encode_query(params))
@@ -398,12 +455,6 @@ def run_once(seen, alert=True, syntax=None):
         org = organic(items)
         size_list = ", ".join(sorted({(extract_size(i) or "?").strip() for i in org}))
         print(f"[i] {name}: {len(org)} articles hors sponsorisés | tailles : {size_list or 'aucune'}")
-
-        # Auto-diagnostic : si la taille reste introuvable, on dump la structure
-        if org and all(not extract_size(i) for i in org[:10]):
-            box = org[0].get("item_box") or {}
-            print(f"[!] Taille introuvable — item_box du 1er article : "
-                  f"{json.dumps(box, ensure_ascii=False)[:300]}")
 
         new_count = 0
         for item in org:
@@ -427,8 +478,8 @@ def run_once(seen, alert=True, syntax=None):
 
         print(f"[{'+' if new_count else '-'}] {new_count} nouveau(x) — {name}")
         time.sleep(2)
-    save_state(seen, syntax)
-    return syntax
+    save_state(seen, syntax, id_map)
+    return syntax, id_map
 
 
 def main():
@@ -441,21 +492,21 @@ def main():
         print("Message de test envoyé ✔️" if ok else "Échec ✖️")
         return
 
-    seen, syntax = load_state()
+    seen, syntax, id_map = load_state()
     first = not seen
 
     if "--once" in sys.argv:              # mode GitHub Actions : une passe puis exit
-        run_once(seen, alert=not first, syntax=syntax)
+        run_once(seen, alert=not first, syntax=syntax, id_map=id_map)
         return
 
     if first:
         print("Premier lancement : baseline des articles existants (pas d'alertes).")
-        run_once(seen, alert=False, syntax=syntax)
+        run_once(seen, alert=False, syntax=syntax, id_map=id_map)
 
     print(f"Surveillance active, scan toutes les {CHECK_INTERVAL}s...")
     while True:
         time.sleep(CHECK_INTERVAL)
-        syntax = run_once(seen, alert=True, syntax=syntax)
+        syntax, id_map = run_once(seen, alert=True, syntax=syntax, id_map=id_map)
 
 
 if __name__ == "__main__":
