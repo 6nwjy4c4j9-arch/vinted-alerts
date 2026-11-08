@@ -26,7 +26,7 @@ STATE_FILE = Path("vinted_seen_items.json")
 # Tailles acceptées -> vérification LOCALE avant chaque alerte (infaillible).
 # Matching tolérant : "L" accepte "L" et "L / UK 16-18", mais ni "XL" ni "Large".
 # Plusieurs tailles : {"L", "W32", "36 in | 90 cm"} — vide set() = tout accepter.
-ALLOWED_SIZES = {"L"}
+ALLOWED_SIZES = {"L","W30","W32"}
 
 # Paramètre du filtre taille côté API :
 #   "auto"  -> teste les variantes et retient celle qui filtre RÉELLEMENT
