@@ -24,8 +24,8 @@ CHECK_INTERVAL = 60
 STATE_FILE = Path("vinted_seen_items.json")
 
 # Tailles acceptées -> vérification LOCALE avant chaque alerte (infaillible,
-# même si l'API ignore le filtre taille). Insensible à la casse/espaces.
-# Plusieurs tailles : {"M", "L", "XL", "XXL"} — vide set() = tout accepter.
+# même si l'API ignore le filtre taille). Matching tolérant : "L" accepte
+# "L" et "L / UK 16-18" mais ni "XL" ni "Large". Vide set() = tout accepter.
 ALLOWED_SIZES = {"L"}
 
 # Paramètre du filtre taille côté API :
@@ -45,15 +45,13 @@ SKIP_PROMOTED = True  # ignore les articles sponsorisés (souvent hors-sujet)
 JUNK_PARAMS = {"page", "time", "search_id", "order", "per_page"}
 
 # Renommage des filtres dont l'API n'accepte pas le nom d'origine.
-# size_ids est volontairement ABSENT : ses 2 variantes sont testées
-# (c'est lui qui était silencieusement ignoré par l'API).
+# size_ids est volontairement ABSENT : ses 2 variantes sont testées.
 PARAM_MAP = {
     "brand_ids": "attribute_ids[brand]",
     "catalog_ids": "attribute_ids[catalog]",
     "status_ids": "attribute_ids[status]",
 }
 
-# Variantes pour le filtre taille : (label affiché, clé API)
 SIZE_VARIANTS = [
     ("size_ids[]", "size_ids"),                        # syntaxe du site web
     ("attribute_ids[size][]", "attribute_ids[size]"),  # famille attribute_ids
@@ -146,22 +144,73 @@ def fetch_query(session, query):
     return items, r.url
 
 
+# ---------- Extraction des champs (API sept. 2026) ----------
+
+def get_item_box(item):
+    box = item.get("item_box")
+    return box if isinstance(box, dict) else {}
+
+
+def extract_size(item):
+    """Taille de l'article.
+
+    Depuis sept. 2026 l'API catalogue renvoie size_title=null : la taille
+    se trouve dans item_box.accessibility_label ("..., Size: L / UK 16-18, ...")
+    ou item_box.second_line ("L / UK 16-18 · Very good").
+    """
+    size = item.get("size_title")
+    if size:
+        return str(size).strip()
+
+    box = get_item_box(item)
+    label = str(box.get("accessibility_label") or "")
+    m = re.search(r"(?:Size|Taille)\s*:\s*([^,]+)", label)
+    if m:
+        return m.group(1).strip()
+
+    second = str(box.get("second_line") or "")
+    if "·" in second:                       # "L / UK 16-18 · Very good"
+        return second.split("·", 1)[0].strip()
+    return ""                               # pas de "·" = probablement la condition seule
+
+
+def extract_brand(item):
+    brand = item.get("brand_title")
+    if brand:
+        return str(brand)
+    return str(get_item_box(item).get("first_line") or "")
+
+
+def size_matches(size_title, allowed):
+    """True si la taille correspond à l'une des tailles autorisées.
+    'L' matche 'L' et 'L / UK 16-18', mais ni 'XL' ni 'Large'."""
+    s = str(size_title or "").strip().lower()
+    if not s or s == "?":
+        return False
+    for a in allowed:
+        a = str(a).strip().lower()
+        if not a:
+            continue
+        if s == a or re.match(rf"^{re.escape(a)}\b", s):
+            return True
+    return False
+
+
 def choose_syntax(session, params, name):
     """Trouve la variante qui filtre RÉELLEMENT par taille.
 
-    Vinted répond HTTP 200 même quand il ignore un filtre inconnu : on ne
-    peut pas se fier au code de retour. On compare donc les tailles
-    renvoyées avec filtre à une requête de référence SANS filtre taille.
+    Vinted répond HTTP 200 même quand il ignore un filtre inconnu : on
+    compare donc les tailles renvoyées avec filtre à une requête de
+    référence SANS filtre taille.
     """
     print(f"[?] Détection du filtre taille pour '{name}' :")
-    allowed = {s.strip().lower() for s in ALLOWED_SIZES}
+    allowed = list(ALLOWED_SIZES)
 
-    # Référence : même recherche sans filtre taille
     base_sizes = set()
     base = {k: v for k, v in params.items() if k != "size_ids"}
     try:
         base_items, _ = fetch_query(session, encode_query(base))
-        base_sizes = {str(i.get("size_title") or "?").strip().lower() for i in base_items}
+        base_sizes = {(extract_size(i) or "?").strip().lower() for i in base_items}
         print(f"    {'sans filtre':23} : {len(base_items):3} articles | "
               f"{len(base_sizes)} tailles distinctes")
     except Exception as e:
@@ -178,9 +227,9 @@ def choose_syntax(session, params, name):
             print(f"    {label:23} : échec — {e}")
             time.sleep(1)
             continue
-        sizes = {str(i.get("size_title") or "?").strip().lower() for i in items}
+        sizes = {(extract_size(i) or "?").strip().lower() for i in items}
         if allowed:
-            hors = sorted(s for s in sizes if s not in allowed)
+            hors = sorted(s for s in sizes if not size_matches(s, allowed))
             effectif = bool(sizes) and not hors
         else:
             hors = []
@@ -256,13 +305,13 @@ def send_telegram(text):
 
 def send_alert(item, search_name):
     title = html.escape(item.get("title") or "Article")
-    brand = html.escape(item.get("brand_title") or "Sans marque")
-    size = item.get("size_title") or ""
+    brand = html.escape(extract_brand(item) or "Sans marque")
+    size = extract_size(item)
     price = build_price(item)
     url = build_item_url(item)
     photo = extract_photo(item)
 
-    size_txt = f"\n📏 Taille : {html.escape(str(size))}" if size else ""
+    size_txt = f"\n📏 Taille : {html.escape(size)}" if size else ""
     text = (
         f"🔔 <b>Nouvelle annonce</b> — {html.escape(search_name)}\n\n"
         f"👕 {title}\n"
@@ -288,7 +337,6 @@ def send_alert(item, search_name):
 
 def run_once(seen, alert=True, syntax=None):
     session = new_session()
-    allowed = {s.strip().lower() for s in ALLOWED_SIZES}
     for url in SEARCH_URLS:
         params = url_to_params(url)
         name = params.get("search_text", "recherche")
@@ -322,8 +370,14 @@ def run_once(seen, alert=True, syntax=None):
             print(f"[!] Erreur sur '{name}' : {e}")
             continue
 
-        size_list = ", ".join(sorted({str(i.get("size_title") or "?").strip() for i in items}))
+        size_list = ", ".join(sorted({(extract_size(i) or "?").strip() for i in items}))
         print(f"[i] {name}: {len(items)} articles | tailles : {size_list or 'aucune'}")
+
+        # Auto-diagnostic : si la taille reste introuvable, on dump la structure
+        if items and all(not extract_size(i) for i in items[:10]):
+            box = items[0].get("item_box") or {}
+            print(f"[!] Taille introuvable — item_box du 1er article : "
+                  f"{json.dumps(box, ensure_ascii=False)[:300]}")
 
         new_count = 0
         for item in items:
@@ -334,9 +388,9 @@ def run_once(seen, alert=True, syntax=None):
                 continue
             seen.add(item_id)
 
-            # Filet de sécurité : la taille doit être dans ALLOWED_SIZES
-            size_title = str(item.get("size_title") or "").strip()
-            if allowed and size_title.lower() not in allowed:
+            # Filet de sécurité : la taille doit correspondre à ALLOWED_SIZES
+            size_title = extract_size(item)
+            if ALLOWED_SIZES and not size_matches(size_title, ALLOWED_SIZES):
                 print(f"  [skip] taille « {size_title or '?'} » : "
                       f"{str(item.get('title') or '')[:45]}")
                 continue
