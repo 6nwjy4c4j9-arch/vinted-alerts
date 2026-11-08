@@ -8,7 +8,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
 
 import requests
 
@@ -17,15 +17,22 @@ import requests
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-BASE_URL = "https://www.vinted.co.uk"                     # vitrine : session/cookies
-API_URL = "https://api.vinted.co.uk/svc-catalogue/items"   # API : nouvel hôte depuis sept. 2026
+BASE_URL = "https://www.vinted.co.uk"                      # vitrine : session/cookies
+API_URL = "https://api.vinted.co.uk/svc-catalogue/items"   # API catalogue
 LOCALE = "en-GB"
 CHECK_INTERVAL = 60
 STATE_FILE = Path("vinted_seen_items.json")
 
-# Colle ici tes URLs de recherche Vinted (page catalog)
+# Encodage des filtres multi-valeurs (ici : 4 tailles) :
+#   "auto"  -> le script compare les syntaxes et choisit (recommandé)
+#   "inner" -> attribute_ids[size][]=209&attribute_ids[size][]=1438...
+#   "flat"  -> attribute_ids[size]=209&attribute_ids[size]=1438...
+#   "csv"   -> attribute_ids[size]=209,1438,1638,1640
+ARRAY_SYNTAX = "auto"
+
+# Colle ici tes URLs de recherche Vinted (page catalog), telles quelles
 SEARCH_URLS = [
-    "https://www.vinted.co.uk/catalog?search_text=colt&search_id=4680351837&size_ids[]=208&page=1&time=1792332757&brand_ids[]=368277",
+    "https://www.vinted.co.uk/catalog?search_text=Colt&brand_ids[]=368277&size_ids[]=209&size_ids[]=1438&size_ids[]=1638&size_ids[]=1640&search_id=4252287858&order=newest_first",
 ]
 
 SKIP_PROMOTED = True  # ignore les articles sponsorisés (souvent hors-sujet)
@@ -41,6 +48,8 @@ PARAM_MAP = {
     "catalog_ids": "attribute_ids[catalog]",
     "status_ids": "attribute_ids[status]",
 }
+
+SYNTAX_ORDER = ("inner", "flat", "csv")
 
 PAGE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -76,12 +85,28 @@ def url_to_params(url):
     """URL de recherche Vinted -> paramètres API (avec renommage des filtres)."""
     params = {}
     for key, values in parse_qs(urlparse(url).query).items():
-        base = key[:-2] if key.endswith("[]") else key   # brand_ids[] -> brand_ids
-        new_key = PARAM_MAP.get(base, base)              # -> attribute_ids[brand]
+        base = key[:-2] if key.endswith("[]") else key    # size_ids[] -> size_ids
+        new_key = PARAM_MAP.get(base, base)               # -> attribute_ids[size]
         params[new_key] = values if len(values) > 1 else values[0]
     for junk in JUNK_PARAMS:
         params.pop(junk, None)
     return params
+
+
+def encode_query(params, syntax):
+    """Construit la query string en gérant les filtres multi-valeurs."""
+    pairs = []
+    for key, val in params.items():
+        if isinstance(val, list):
+            if syntax == "inner":                       # clé[] répétée
+                pairs += [(f"{key}[]", v) for v in val]
+            elif syntax == "flat":                      # clé répétée
+                pairs += [(key, v) for v in val]
+            else:                                       # csv
+                pairs.append((key, ",".join(val)))
+        else:
+            pairs.append((key, val))
+    return urlencode(pairs)
 
 
 def new_session():
@@ -103,8 +128,8 @@ def new_session():
     return s
 
 
-def fetch_items(session, params):
-    r = session.get(API_URL, params=params, timeout=30)
+def fetch_query(session, query):
+    r = session.get(f"{API_URL}?{query}", timeout=30)
     if r.status_code == 404:
         raise RuntimeError("404 : endpoint introuvable — l'API Vinted a encore changé")
     if r.status_code in (403, 429):
@@ -115,6 +140,33 @@ def fetch_items(session, params):
     if not isinstance(items, list):
         raise RuntimeError(f"réponse inattendue: {list(data)[:5]}")
     return items, r.url
+
+
+def choose_syntax(session, params, name):
+    """Compare les syntaxes d'encodage multi-valeurs et retient la meilleure."""
+    print(f"[?] Comparaison des syntaxes pour '{name}' :")
+    results = []
+    for syntax in SYNTAX_ORDER:
+        try:
+            items, _ = fetch_query(session, encode_query(params, syntax))
+        except Exception as e:
+            print(f"    {syntax:5} : échec — {e}")
+            time.sleep(1)
+            continue
+        sizes = sorted({str(i.get("size_title") or "?") for i in items})
+        print(f"    {syntax:5} : {len(items):3} articles | tailles : {', '.join(sizes) or 'aucune'}")
+        results.append((syntax, len(items), sizes))
+        time.sleep(1)
+    if not results:
+        raise RuntimeError("aucune syntaxe n'a fonctionné (API bloquée ?)")
+    # La bonne syntaxe cible peu de tailles distinctes (les 4 choisies) ;
+    # un filtre ignoré renvoie au contraire des tailles très variées.
+    focused = [r for r in results if len(r[2]) <= 5] or results
+    best = max(focused, key=lambda r: r[1])
+    if len(best[2]) > 5:
+        print("[!] Aucune syntaxe ne filtre par taille — vérifie les résultats !")
+    print(f"[✓] Syntaxe retenue : {best[0]}")
+    return best[0]
 
 
 def build_item_url(item):
@@ -141,12 +193,15 @@ def extract_photo(item):
 
 def load_state():
     if STATE_FILE.exists():
-        return set(json.loads(STATE_FILE.read_text()))
-    return set()
+        data = json.loads(STATE_FILE.read_text())
+        if isinstance(data, list):                     # ancien format (liste d'IDs)
+            return set(data), None
+        return set(data.get("seen", [])), data.get("array_syntax")
+    return set(), None
 
 
-def save_state(seen):
-    STATE_FILE.write_text(json.dumps(sorted(seen)))
+def save_state(seen, syntax=None):
+    STATE_FILE.write_text(json.dumps({"seen": sorted(seen), "array_syntax": syntax}))
 
 
 # ---------- Telegram ----------
@@ -194,21 +249,34 @@ def send_alert(item, search_name):
 
 # ---------- Scan ----------
 
-def run_once(seen, alert=True):
+def run_once(seen, alert=True, syntax=None):
     session = new_session()
     for url in SEARCH_URLS:
         params = url_to_params(url)
         name = params.get("search_text", "recherche")
         params["order"] = "newest_first"
         params["per_page"] = 96
+        has_multi = any(isinstance(v, list) for v in params.values())
 
         try:
-            items, req_url = fetch_items(session, params)
+            if has_multi and ARRAY_SYNTAX == "auto":
+                if not syntax:
+                    syntax = choose_syntax(session, params, name)
+                try:
+                    items, req_url = fetch_query(session, encode_query(params, syntax))
+                except Exception:
+                    print("[!] Syntaxe en cache échouée -> nouvelle comparaison")
+                    syntax = choose_syntax(session, params, name)
+                    items, req_url = fetch_query(session, encode_query(params, syntax))
+            else:
+                chosen = ARRAY_SYNTAX if ARRAY_SYNTAX != "auto" else "inner"
+                items, req_url = fetch_query(session, encode_query(params, chosen))
         except Exception as e:
             print(f"[!] Erreur sur '{name}' : {e}")
             continue
 
-        print(f"[i] {name}: {len(items)} articles | {req_url}")
+        size_list = ", ".join(sorted({str(i.get("size_title") or "?") for i in items}))
+        print(f"[i] {name}: {len(items)} articles | tailles : {size_list or 'aucune'}")
 
         new_count = 0
         for item in items:
@@ -226,27 +294,35 @@ def run_once(seen, alert=True):
 
         print(f"[{'+' if new_count else '-'}] {new_count} nouveau(x) — {name}")
         time.sleep(2)
-    save_state(seen)
+    save_state(seen, syntax)
+    return syntax
 
 
 def main():
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        sys.exit("Définis d'abord les variables d'environnement :\n"
+                 "  export TELEGRAM_BOT_TOKEN='...' && export TELEGRAM_CHAT_ID='...'")
+
     if "--test" in sys.argv:
         ok = send_telegram("✅ Test : bot Vinted UK → Telegram opérationnel !")
         print("Message de test envoyé ✔️" if ok else "Échec ✖️")
         return
 
-    seen = load_state()
-    if not seen:
-        print("Premier lancement : baseline des articles existants (pas d'alertes).")
-        run_once(seen, alert=False)
+    seen, syntax = load_state()
+    first = not seen
 
-    if "--once" in sys.argv:  # mode GitHub Actions : une passe puis exit
+    if "--once" in sys.argv:              # mode GitHub Actions : une passe puis exit
+        run_once(seen, alert=not first, syntax=syntax)
         return
+
+    if first:
+        print("Premier lancement : baseline des articles existants (pas d'alertes).")
+        run_once(seen, alert=False, syntax=syntax)
 
     print(f"Surveillance active, scan toutes les {CHECK_INTERVAL}s...")
     while True:
         time.sleep(CHECK_INTERVAL)
-        run_once(seen, alert=True)
+        syntax = run_once(seen, alert=True, syntax=syntax)
 
 
 if __name__ == "__main__":
