@@ -23,14 +23,14 @@ LOCALE = "en-GB"
 CHECK_INTERVAL = 60
 STATE_FILE = Path("vinted_seen_items.json")
 
-# Tailles acceptées -> vérification LOCALE avant chaque alerte (infaillible,
-# même si l'API ignore le filtre taille). Matching tolérant : "L" accepte
-# "L" et "L / UK 16-18" mais ni "XL" ni "Large". Vide set() = tout accepter.
+# Tailles acceptées -> vérification LOCALE avant chaque alerte (infaillible).
+# Matching tolérant : "L" accepte "L" et "L / UK 16-18", mais ni "XL" ni "Large".
+# Plusieurs tailles : {"M", "L"} — vide set() = tout accepter.
 ALLOWED_SIZES = {"L"}
 
 # Paramètre du filtre taille côté API :
 #   "auto"  -> teste les variantes et retient celle qui filtre RÉELLEMENT
-#   "size_ids" ou "attribute_ids[size]" -> force une variante
+#   "attribute_ids[size]" ou "size_ids" -> force une variante
 SIZE_PARAM = "auto"
 
 # Colle ici tes URLs de recherche Vinted (page catalog), telles quelles
@@ -45,16 +45,19 @@ SKIP_PROMOTED = True  # ignore les articles sponsorisés (souvent hors-sujet)
 JUNK_PARAMS = {"page", "time", "search_id", "order", "per_page"}
 
 # Renommage des filtres dont l'API n'accepte pas le nom d'origine.
-# size_ids est volontairement ABSENT : ses 2 variantes sont testées.
+# size_ids est volontairement ABSENT : ses variantes sont testées.
 PARAM_MAP = {
     "brand_ids": "attribute_ids[brand]",
     "catalog_ids": "attribute_ids[catalog]",
     "status_ids": "attribute_ids[status]",
 }
 
+# Variantes pour le filtre taille, par ordre de préférence.
+# Format confirmé de la nouvelle API : CSV dans une seule valeur
+# (attribute_ids[size]=209,1438) — les formes répétées clé[]=v sont ignorées.
 SIZE_VARIANTS = [
-    ("size_ids[]", "size_ids"),                        # syntaxe du site web
-    ("attribute_ids[size][]", "attribute_ids[size]"),  # famille attribute_ids
+    ("attribute_ids[size] (csv)", "attribute_ids[size]"),
+    ("size_ids[] (répété)", "size_ids"),      # ancienne syntaxe du site, fallback
 ]
 SIZE_KEYS = {key for _, key in SIZE_VARIANTS}
 
@@ -100,12 +103,22 @@ def url_to_params(url):
     return params
 
 
-def encode_query(params):
-    """Query string ; les listes sont encodées en clé[] répétée (style du site web)."""
+def encode_query(params, repeat_size=False):
+    """Query string.
+
+    Format confirmé de la nouvelle API (sept. 2026) : les filtres
+    multi-valeurs sont passés en CSV dans une seule valeur
+    (attribute_ids[size]=209,1438,1638,1640) ; les formes répétées
+    clé[]=v sont silencieusement ignorées par l'API.
+    repeat_size=True -> encode size_ids en clé[] répétée (variante fallback).
+    """
     pairs = []
     for key, val in params.items():
         if isinstance(val, list):
-            pairs += [(f"{key}[]", v) for v in val]
+            if repeat_size and key == "size_ids":
+                pairs += [(f"{key}[]", v) for v in val]
+            else:
+                pairs.append((key, ",".join(str(v) for v in val)))
         else:
             pairs.append((key, val))
     return urlencode(pairs)
@@ -171,7 +184,7 @@ def extract_size(item):
     second = str(box.get("second_line") or "")
     if "·" in second:                       # "L / UK 16-18 · Very good"
         return second.split("·", 1)[0].strip()
-    return ""                               # pas de "·" = probablement la condition seule
+    return ""                               # pas de "·" = condition seule
 
 
 def extract_brand(item):
@@ -179,6 +192,13 @@ def extract_brand(item):
     if brand:
         return str(brand)
     return str(get_item_box(item).get("first_line") or "")
+
+
+def organic(items):
+    """Retire les articles sponsorisés (ils ignorent les filtres)."""
+    if not SKIP_PROMOTED:
+        return items
+    return [i for i in items if i.get("content_source") != "search_promoted_items"]
 
 
 def size_matches(size_title, allowed):
@@ -201,7 +221,8 @@ def choose_syntax(session, params, name):
 
     Vinted répond HTTP 200 même quand il ignore un filtre inconnu : on
     compare donc les tailles renvoyées avec filtre à une requête de
-    référence SANS filtre taille.
+    référence SANS filtre taille. Les sponsorisés sont exclus de
+    l'analyse (ils ignorent les filtres par conception).
     """
     print(f"[?] Détection du filtre taille pour '{name}' :")
     allowed = list(ALLOWED_SIZES)
@@ -210,11 +231,11 @@ def choose_syntax(session, params, name):
     base = {k: v for k, v in params.items() if k != "size_ids"}
     try:
         base_items, _ = fetch_query(session, encode_query(base))
-        base_sizes = {(extract_size(i) or "?").strip().lower() for i in base_items}
-        print(f"    {'sans filtre':23} : {len(base_items):3} articles | "
+        base_sizes = {(extract_size(i) or "?").strip().lower() for i in organic(base_items)}
+        print(f"    {'sans filtre':26} : {len(organic(base_items)):3} articles | "
               f"{len(base_sizes)} tailles distinctes")
     except Exception as e:
-        print(f"    {'sans filtre':23} : échec ({e})")
+        print(f"    {'sans filtre':26} : échec ({e})")
     time.sleep(1)
 
     results = []  # (clé, nb_articles, filtre_effectif, tailles, hors_sélection)
@@ -222,12 +243,13 @@ def choose_syntax(session, params, name):
         p = dict(params)
         p[key] = p.pop("size_ids")
         try:
-            items, _ = fetch_query(session, encode_query(p))
+            items, _ = fetch_query(session, encode_query(p, repeat_size=(key == "size_ids")))
         except Exception as e:
-            print(f"    {label:23} : échec — {e}")
+            print(f"    {label:26} : échec — {e}")
             time.sleep(1)
             continue
-        sizes = {(extract_size(i) or "?").strip().lower() for i in items}
+        org = organic(items)
+        sizes = {(extract_size(i) or "?").strip().lower() for i in org}
         if allowed:
             hors = sorted(s for s in sizes if not size_matches(s, allowed))
             effectif = bool(sizes) and not hors
@@ -235,9 +257,9 @@ def choose_syntax(session, params, name):
             hors = []
             effectif = bool(base_sizes) and sizes < base_sizes
         verdict = "✔ filtre effectif" if effectif else "✘ filtre ignoré"
-        print(f"    {label:23} : {len(items):3} articles | "
+        print(f"    {label:26} : {len(org):3} articles | "
               f"tailles : {', '.join(sorted(sizes)) or 'aucune'} | {verdict}")
-        results.append((key, len(items), effectif, sizes, hors))
+        results.append((key, len(org), effectif, sizes, hors))
         time.sleep(1)
 
     if not results:
@@ -282,12 +304,14 @@ def load_state():
         data = json.loads(STATE_FILE.read_text())
         if isinstance(data, list):                     # très ancien format
             return set(data), None
-        return set(data.get("seen", [])), data.get("size_param")
+        # Ancienne clé "size_param" volontairement ignorée : ce cache date
+        # d'avant la découverte du format CSV -> nouvelle détection.
+        return set(data.get("seen", [])), data.get("size_param_v2")
     return set(), None
 
 
 def save_state(seen, size_param=None):
-    STATE_FILE.write_text(json.dumps({"seen": sorted(seen), "size_param": size_param}))
+    STATE_FILE.write_text(json.dumps({"seen": sorted(seen), "size_param_v2": size_param}))
 
 
 # ---------- Telegram ----------
@@ -355,34 +379,34 @@ def run_once(seen, alert=True, syntax=None):
                 p = dict(params)
                 p[key] = p.pop("size_ids")
                 try:
-                    items, _ = fetch_query(session, encode_query(p))
+                    items, _ = fetch_query(session, encode_query(p, repeat_size=(key == "size_ids")))
                 except Exception:
                     if SIZE_PARAM in SIZE_KEYS:
                         raise
                     print("[!] Variante en cache échouée -> nouvelle détection")
                     syntax = choose_syntax(session, params, name)
+                    key = syntax
                     p = dict(params)
-                    p[syntax] = p.pop("size_ids")
-                    items, _ = fetch_query(session, encode_query(p))
+                    p[key] = p.pop("size_ids")
+                    items, _ = fetch_query(session, encode_query(p, repeat_size=(key == "size_ids")))
             else:
                 items, _ = fetch_query(session, encode_query(params))
         except Exception as e:
             print(f"[!] Erreur sur '{name}' : {e}")
             continue
 
-        size_list = ", ".join(sorted({(extract_size(i) or "?").strip() for i in items}))
-        print(f"[i] {name}: {len(items)} articles | tailles : {size_list or 'aucune'}")
+        org = organic(items)
+        size_list = ", ".join(sorted({(extract_size(i) or "?").strip() for i in org}))
+        print(f"[i] {name}: {len(org)} articles hors sponsorisés | tailles : {size_list or 'aucune'}")
 
         # Auto-diagnostic : si la taille reste introuvable, on dump la structure
-        if items and all(not extract_size(i) for i in items[:10]):
-            box = items[0].get("item_box") or {}
+        if org and all(not extract_size(i) for i in org[:10]):
+            box = org[0].get("item_box") or {}
             print(f"[!] Taille introuvable — item_box du 1er article : "
                   f"{json.dumps(box, ensure_ascii=False)[:300]}")
 
         new_count = 0
-        for item in items:
-            if SKIP_PROMOTED and item.get("content_source") == "search_promoted_items":
-                continue
+        for item in org:
             item_id = str(item.get("id", ""))
             if not item_id or item_id in seen:
                 continue
